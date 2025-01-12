@@ -155,6 +155,57 @@ WHERE DeletedTime IS NULL --Filtered Index
 
 - 欄位常是 <> 或 NOT IN 或 IS NULL 這種條件，索引優化器在實務上未必會使用 Seek(或容易退化為 Range Scan)，需實際確認效能
 
+### Slow In Applicationm, Fast In SSMS?
+
+[ref](https://www.sommarskog.se/query-plan-mysteries.html#Presumptions
+)
+
+1. in a clustered index the leaf pages contain the data, so a clustered index scan and a table scan is essentially the same the thing
+
+2. Why the optimizer arrives at different execution plans?
+because the estimates are different
+
+3. Where Do These Estimates Come From? Why are the estimates different?
+
+```sql
+CREATE PROCEDURE List_orders_1 AS  --1
+   SELECT * FROM Orders WHERE OrderDate > '20000101'
+go
+CREATE PROCEDURE List_orders_2 @fromdate datetime AS --2
+   SELECT * FROM Orders WHERE OrderDate > @fromdate
+go
+CREATE PROCEDURE List_orders_3 @fromdate datetime AS --3
+   DECLARE @fromdate_copy datetime
+   SELECT @fromdate_copy = @fromdate
+   SELECT * FROM Orders WHERE OrderDate > @fromdate_copy
+go
+```
+
+sp1 直接透過常數對比統計資訊
+
+sp2 因為不知道parameter最後的於查詢的實際值，所以會透過input來估計
+>This strategy of looking at the values of the input parameters when optimising a stored procedure is known as **Parameter Sniffing**
+
+sp3 input被變數取代，優化器無法得知實際input，最後只能根據'>'這個運算元 + 統計資訊假設後估算
+
+4.Parameter Sniffing 的潛在問題?
+
+```sql
+CREATE PROCEDURE List_orders_4 @fromdate datetime = NULL AS
+   IF @fromdate IS NULL
+      SELECT @fromdate = '19900101'
+SELECT * FROM Orders WHERE OrderDate > @fromdate
+```
+
+```EXEC List_orders_4```
+由於未提供參數，@fromdate 會初始為 NULL，隨後在過程內被設定為 '19900101'
+雖然實際上需要返回大部分的資料列(scan較佳)，卻採用「Index Seek + Key Lookup」的策略
+
+![alt text](image.png)
+顯示 830 of 1 時，代表返回了 830 行，但估計值是一行
+
+
+
 ## 完整profiler對應SQL
 
 ```SQL
@@ -687,30 +738,3 @@ FROM (
 ) AS [u0]',N'@__appUserId_0 bigint,@__tenantId_1 bigint,@__noFormNoStates_2 nvarchar(4000),@__hasFormNoIncludeStates_3 nvarchar(4000),@__hasFormNoExcludeStates_4 nvarchar(4000),@__8__locals1_executingRevokingFlowIds_5 nvarchar(4000)',@__appUserId_0=6070292994734084,@__tenantId_1=6395217529958400,@__noFormNoStates_2=N'["PG0","PG1"]',@__hasFormNoIncludeStates_3=N'["P1"]',@__hasFormNoExcludeStates_4=N'["P2"]',@__8__locals1_executingRevokingFlowIds_5=N'[6749830704793609]'
 
 ```
-
-## Parameter sniffing
-
-### PRD問題重現
-
-![alt text](image-4.png)
-
-![alt text](image-5.png)
-
-> 18:43執行一次  --> DTU 飆到100% --> 18:46降回0
-
-### 查詢參數差異
-
-以下是兩個查詢主要差異的表格化比較：
-
-| 比較項目              | 第一個查詢                                               | 第二個查詢                                                |
-|-----------------------|----------------------------------------------------------|-----------------------------------------------------------|
-| **日期範圍 - 開始時間** | `@__filterCreatedTimeStart_Value_2 = '2024-11-06T16:00:00Z'` | `@__filterCreatedTimeStart_Value_2 = '2024-09-08T16:00:00.000Z'` |
-| **日期範圍 - 結束時間** | `@__filterCreatedTimeEnd_Value_3 = '2025-01-07T15:59:59.998Z'` | `@__filterCreatedTimeEnd_Value_3 = '2025-01-09T15:59:59.998Z'` |
-| **無 FormNo 狀態**      | `@__noFormNoStates_4 = '[]'`                             | `@__noFormNoStates_4 = N'["PG0","PG1"]'`                   |
-| **有 FormNo 包含狀態**   | `@__hasFormNoIncludeStates_5 = '[]'`                     | `@__hasFormNoIncludeStates_5 = N'["P1"]'`                  |
-| **有 FormNo 排除狀態**   | `@__hasFormNoExcludeStates_6 = '[]'`                     | `@__hasFormNoExcludeStates_6 = N'["P2"]'`                  |
-| **撤銷 Flow IDs**       | `@__8__locals1_executingRevokingFlowIds_7 = '[]'`        | `@__8__locals1_executingRevokingFlowIds_7 = NULL`           |
-| **最外層 WHERE 條件**    | 使用 `WHERE [CreatedTime] > @__filterCreatedTimeStart_Value_2 AND [CreatedTime] < @__filterCreatedTimeEnd_Value_3` | 無該最外層日期篩選條件                                             |
-| **ORDER BY 子句**      | 排序條件包含多個欄位：`[s5].[LatestUpdatedTime] DESC, [s5].[MainFlowRecordId], ... , [s6].[Id0]` | 僅排序 `[s5].[LatestUpdatedTime] DESC`，後面無其他排序欄位            |
-
-此表格概述了兩個查詢在參數值、篩選條件和排序邏輯上的主要不同點。
